@@ -28,14 +28,19 @@ import torch
 from moge.model.v2 import MoGeModel
 import torch.nn.functional as F
 import shutil
+import argparse
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, default="/mnt/nfs/SpatialAI/Datasets/av2/train")
+    args = parser.parse_args()
 
     # Initialize the MoGe model
     device = torch.device("cuda")
     # MoGe_model = MoGeModel.from_pretrained("/work/weights/moge-2-vitl-normal/model.pt").to(device)  
 
-    data_path = "/work/datasets/av2/val"
+    data_path = args.path
+    print('Clean path ', data_path)
     data_path_Path = Path(data_path)
 
     # loader = AV2SensorDataLoader(data_dir=data_path_Path, labels_dir=data_path_Path)

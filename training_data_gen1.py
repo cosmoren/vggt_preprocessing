@@ -35,7 +35,7 @@ if __name__ == "__main__":
     device = torch.device("cuda")
     MoGe_model = MoGeModel.from_pretrained("/work/weights/moge-2-vitl-normal/model.pt").to(device)  
 
-    data_path = "/work/datasets/av2/val"
+    data_path = "/work/datasets/av2/test"
     data_path_Path = Path(data_path)
 
     loader = AV2SensorDataLoader(data_dir=data_path_Path, labels_dir=data_path_Path)
