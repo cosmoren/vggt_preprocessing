@@ -230,5 +230,5 @@ def align_with_spatial_scale_bias_dense(I_rgb, P, D, M,
 
     # 重建并在观测处硬覆盖
     z = s_dense * P + b_dense
-    z = M*D + (1-M)*z
+    z = M*D + (1-M)*z 
     return z, s_dense, b_dense, alpha, beta

@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--moge_model_path", type=str, default="/mnt/nfs/SpatialAI/weights/moge-2-vitl-normal/model.pt")
-    parser.add_argument("--av2_data_path", type=str, default="/mnt/nfs/SpatialAI/Datasets/av2/test")
+    parser.add_argument("--av2_data_path", type=str, default="/mnt/nfs/SpatialAI/Datasets/av2/small")
     args = parser.parse_args()
 
     NUM_RANGE_BINS: Final[int] = 50
@@ -81,6 +81,8 @@ if __name__ == "__main__":
             if 'depth' in camera or 'center' not in camera:
                 continue
             camera_depth = camera+'_depth'
+            camera_sparse_depth = camera+'_sparse_depth'
+            os.makedirs( os.path.join(data_path, scene_id, 'sensors', 'cameras', camera_sparse_depth), exist_ok=True )
             os.makedirs( os.path.join(data_path, scene_id, 'sensors', 'cameras', camera_depth), exist_ok=True )
 
             cam_im_fpaths = loader.get_ordered_log_cam_fpaths(scene_id, camera)
@@ -155,8 +157,6 @@ if __name__ == "__main__":
                 blended_bgr = raster_utils.blend_images(img_bgr, img_empty)
                 frame_rgb = blended_bgr[:, :, ::-1]
 
-                cv2.imwrite("aa.jpg", blended_bgr)
-
                 # compute camera to city SE3 transform
                 T_ego2city = np.eye(4)
                 T_ego2city[0:3, 0:3] = city_SE3_ego.rotation
@@ -196,6 +196,7 @@ if __name__ == "__main__":
                                                                             robust = False,         # 是否输出鲁棒权重（Huber）
                                                                             huber_delta = 0.008     # Huber 损失阈值（和深度单位一致） 
                                                                         )
+                sparse_depth = z_lidar*inlier.float()
 
                 dense_depth, s_dense, b_dense, alpha, beta = align_with_spatial_scale_bias_dense(
                     input_image[None,:,:,:], masked_depth[None,None,:,:], z_lidar, inlier.float(),
@@ -207,6 +208,17 @@ if __name__ == "__main__":
                     clip=(2,98) # 去掉极端离群比例
                 )
 
+                # save sparse depth
+                sparse_depth_path = im_fpath.with_suffix('.png')
+                sparse_depth_path_list = list(sparse_depth_path.parts)
+                sparse_depth_path_list[-2] = sparse_depth_path_list[-2]+'_sparse_depth'
+                sparse_depth_path = os.path.join(*sparse_depth_path_list)
+
+                sparse_depth = torch.squeeze(torch.clamp(sparse_depth, max=300.0))
+                scaled_sparse_depth = (sparse_depth.cpu().detach().numpy() / 300 * 65535).astype(np.uint16)
+                cv2.imwrite(sparse_depth_path, scaled_sparse_depth)
+
+                # save dense depth
                 depth_path = im_fpath.with_suffix('.png')
                 depth_path_list = list(depth_path.parts)
                 depth_path_list[-2] = depth_path_list[-2]+'_depth'
