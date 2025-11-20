@@ -13,7 +13,7 @@ from torchvision.utils import flow_to_image, save_image
 from abc import ABC, abstractmethod
 from typing import Tuple, List, Optional, Dict, Any
 from pathlib import Path
-
+import os
 
 class ImagePreprocessor:
     """Handles image preprocessing and resizing operations."""
@@ -405,6 +405,9 @@ class FlowProcessor:
         img1_processed = self.preprocessor.preprocess(img1_batch).to(self.device)
         img2_processed = self.preprocessor.preprocess(img2_batch).to(self.device)
         
+        # Store original dimensions
+        _, _, orig_H, orig_W = img1_batch.shape
+        
         # Resize
         img1_resized = self.preprocessor.resize_to_nearest_multiple(
             img1_processed, k=self.resize_k
@@ -417,7 +420,11 @@ class FlowProcessor:
         # Estimate flow
         flow = self.flow_estimator.estimate_flow(img1_resized, img2_resized)
         
-        results = {'flow': flow}
+        # Store original dimensions in results
+        results = {
+            'flow': flow,
+            'original_size': (orig_H, orig_W)
+        }
         
         # RANSAC decomposition
         if compute_rigid:
@@ -441,27 +448,36 @@ class FlowProcessor:
         self,
         dataset_loader: DatasetLoader,
         batch_size: int = 1,
-        save_dir: Optional[Path] = None
+        save_dir: Optional[Path] = None,
+        vis_dir: Optional[Path] = None
     ):
         """
         Process an entire dataset in batches.
         
-        For each pair, saves results in individual folders:
-        - pair_XXXXXX/scene_flow.pt: [H, W, 4] tensor (rigid_flow + flow_res)
-        - pair_XXXXXX/flow_visualization.jpg: Full flow visualization
-        - pair_XXXXXX/flow_res_visualization.jpg: Residual flow visualization
+        For each pair:
+        - Saves scene_flow.pt in save_dir with filename = original image filename
+        - Saves visualization images in vis_dir/scene_name/img1_name/
+        - Logs RANSAC failures to ransac_failures.txt in save_dir
         
         Args:
             dataset_loader: DatasetLoader instance
             batch_size: Batch size for processing
-            save_dir: Directory to save results (optional)
+            save_dir: Directory to save .pt files (optional)
+            vis_dir: Directory to save visualization images (optional)
         """
         num_pairs = len(dataset_loader)
-        all_results = []
         
         if save_dir:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
+            # RANSAC failure log file (will be created/cleared at processor level)
+            ransac_failure_log = save_dir / 'ransac_failures.txt'
+        else:
+            ransac_failure_log = None
+        
+        if vis_dir:
+            vis_dir = Path(vis_dir)
+            vis_dir.mkdir(parents=True, exist_ok=True)
         
         for batch_idx in range(0, num_pairs, batch_size):
             end_idx = min(batch_idx + batch_size, num_pairs)
@@ -482,33 +498,53 @@ class FlowProcessor:
             results['metadata'] = metadata
             results['indices'] = indices
             
-            all_results.append(results)
             
             # Save if requested
-            if save_dir:
-                self._save_pair_results(results, save_dir, indices)
+            if save_dir or vis_dir:
+                # Get unique scene names in this batch (should be only one for Option 2)
+                unique_scenes = set(metadata['scene_names'])
+                if save_dir:
+                    for scene_name in unique_scenes:
+                        os.makedirs(save_dir / scene_name, exist_ok=True)
+                if vis_dir:
+                    for scene_name in unique_scenes:
+                        os.makedirs(vis_dir / scene_name, exist_ok=True)
+                
+                # Save results (handles per-pair scene names correctly)
+                self._save_pair_results(results, save_dir, vis_dir, indices, ransac_failure_log)
+            
+            # Clean up batch results to free GPU memory
+            del results, img1_batch, img2_batch, metadata
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        return all_results
     
     def _save_pair_results(
         self,
         results: Dict[str, Any],
-        save_dir: Path,
-        indices: List[int]
+        save_dir: Optional[Path],
+        vis_dir: Optional[Path],
+        indices: List[int],
+        ransac_failure_log: Optional[Path] = None
     ):
         """
         Save results for each pair individually.
         
-        For each pair, creates a folder named after the first image (without extension)
-        and organizes by scene to match input dataset structure.
+        For each pair:
+        - Saves scene_flow.pt in save_dir with filename = original image filename
+        - Saves visualization images in vis_dir/scene_name/img1_name/
+        - Logs RANSAC failures to ransac_failure_log file
         
-        Saves:
-        - scene_flow.pt: [H, W, 4] tensor with rigid_flow (channels 0-1) and flow_res (channels 2-3)
-        - flow_visualization.jpg: Visualization of full flow
-        - flow_res_visualization.jpg: Visualization of residual flow
+        Args:
+            results: Processing results dictionary
+            save_dir: Directory to save .pt files (None to skip)
+            vis_dir: Directory to save visualization images (None to skip)
+            indices: List of pair indices in the batch
+            ransac_failure_log: Path to log file for RANSAC failures (None to skip)
         """
         B = results['flow'].shape[0]
         metadata = results['metadata']
+        affine_matrices = results.get('affine_matrices', [None] * B)
         
         # Extract individual pairs from batch
         for i in range(B):
@@ -516,36 +552,114 @@ class FlowProcessor:
             img1_path = Path(metadata['img1_paths'][i])
             scene_name = metadata['scene_names'][i]
             
-            # Get filename without extension
+            # Get filename with extension for .pt file, without extension for directory
+            img1_filename = img1_path.name  # filename with extension (e.g., "009850-3_obj_source_left-0000.png")
             img1_name = img1_path.stem  # filename without extension
             
-            # Create directory structure: output_dir/scene_name/img1_name/
-            pair_dir = save_dir / scene_name / img1_name
-            pair_dir.mkdir(parents=True, exist_ok=True)
-            
             # Get individual pair results
-            flow = results['flow'][i]  # (2, H, W)
-            rigid_flow = results['rigid_flow'][i]  # (2, H, W)
-            flow_res = results['flow_res'][i]  # (2, H, W)
+            flow = results['flow'][i]  # (2, H, W) - resized dimensions
+            rigid_flow = results['rigid_flow'][i]  # (2, H, W) - resized dimensions
+            flow_res = results['flow_res'][i]  # (2, H, W) - resized dimensions
+            orig_H, orig_W = results['original_size']
             
+            # Get current (resized) dimensions
+            _, resized_H, resized_W = flow.shape
+            
+            # Upsample flow tensors back to original dimensions
+            # Flow values need to be scaled by the resize factor since flow is in pixels
+            scale_H = orig_H / resized_H
+            scale_W = orig_W / resized_W
+
+            # print(f"debug: resized_H: {resized_H}, resized_W: {resized_W}; orig_H: {orig_H}, orig_W: {orig_W};")
+
+            flow_orig = flow
+            rigid_flow_orig = rigid_flow
+            flow_res_orig = flow_res
+            if orig_H != resized_H or orig_W != resized_W:
+                # Upsample and scale flow tensors
+                flow_orig = F.interpolate(
+                    flow.unsqueeze(0),  # (1, 2, H, W)
+                    size=(orig_H, orig_W),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)  # (2, orig_H, orig_W)
+                flow_orig = flow_orig * torch.tensor([scale_W, scale_H], device=flow.device).view(2, 1, 1)
+                
+                rigid_flow_orig = F.interpolate(
+                    rigid_flow.unsqueeze(0),  # (1, 2, H, W)
+                    size=(orig_H, orig_W),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)  # (2, orig_H, orig_W)
+                rigid_flow_orig = rigid_flow_orig * torch.tensor([scale_W, scale_H], device=rigid_flow.device).view(2, 1, 1)
+                
+                flow_res_orig = F.interpolate(
+                    flow_res.unsqueeze(0),  # (1, 2, H, W)
+                    size=(orig_H, orig_W),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)  # (2, orig_H, orig_W)
+                flow_res_orig = flow_res_orig * torch.tensor([scale_W, scale_H], device=flow_res.device).view(2, 1, 1)
+
+            #print(f"debug: flow_orig.shape: {flow_orig.shape}, rigid_flow_orig.shape: {rigid_flow_orig.shape}, flow_res_orig.shape: {flow_res_orig.shape};")   
             # Convert to (H, W, 2) format
-            flow_hw = flow.permute(1, 2, 0)  # (H, W, 2)
-            rigid_flow_hw = rigid_flow.permute(1, 2, 0)  # (H, W, 2)
-            flow_res_hw = flow_res.permute(1, 2, 0)  # (H, W, 2)
+            flow_hw = flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
+            rigid_flow_hw = rigid_flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
+            flow_res_hw = flow_res_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
             
-            # Concatenate to create scene_flow: [H, W, 4]
+            # Concatenate to create scene_flow: [orig_H, orig_W, 4]
             # Channels 0-1: rigid_flow, Channels 2-3: flow_res
-            scene_flow = torch.cat([rigid_flow_hw, flow_res_hw], dim=2)  # (H, W, 4)
+            scene_flow = torch.cat([rigid_flow_hw, flow_res_hw], dim=2)  # (orig_H, orig_W, 4)
             scene_flow = scene_flow.to(torch.float16)
             
-            # Save scene_flow.pt
-            torch.save(scene_flow, pair_dir / 'scene_flow.pt')
+            # Check for RANSAC failure (affine_matrix is None)
+            if affine_matrices[i] is None:
+                # Log RANSAC failure
+                if ransac_failure_log is not None:
+                    with open(ransac_failure_log, 'a') as f:
+                        f.write(f"{img1_path}\n")
+                print(f"no available affine matrix for pair {img1_path}, skip this pair")
+                continue
             
-            # Save flow visualization (full flow)
-            flow_img = flow_to_image(flow.unsqueeze(0))  # (1, 3, H, W)
-            save_image(flow_img.float() / 255.0, pair_dir / 'flow_visualization.jpg')
+            # Save .pt file in save_dir with original image filename
+            if save_dir:
+                # Change extension from .png/.jpg to .pt
+                pt_filename = img1_path.stem + '.pt'
+                torch.save(scene_flow, save_dir / scene_name / pt_filename)
             
-            # Save flow_res visualization
-            flow_res_img = flow_to_image(flow_res.unsqueeze(0))  # (1, 3, H, W)
-            save_image(flow_res_img.float() / 255.0, pair_dir / 'flow_res_visualization.jpg')
+            # Save visualization images in vis_dir/scene_name/img1_name/
+            if vis_dir:
+                vis_pair_dir = vis_dir / scene_name / img1_name
+                vis_pair_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save flow visualization (full flow)
+                flow_img = flow_to_image(flow.unsqueeze(0))  # (1, 3, H, W)
+                save_image(flow_img.float() / 255.0, vis_pair_dir / 'flow_visualization.jpg')
+                
+                # Save flow_res visualization
+                flow_res_img = flow_to_image(flow_res.unsqueeze(0))  # (1, 3, H, W)
+                save_image(flow_res_img.float() / 255.0, vis_pair_dir / 'flow_res_visualization.jpg')
 
+                rigid_flow_img = flow_to_image(rigid_flow.unsqueeze(0))  # (1, 3, H, W)
+                save_image(rigid_flow_img.float() / 255.0, vis_pair_dir / 'rigid_flow_visualization.jpg')
+                
+                # Clean up visualization tensors
+                del flow_img, flow_res_img, rigid_flow_img
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Clean up processed flow tensors
+            # All these variables are guaranteed to exist at this point
+            del flow, rigid_flow, flow_res, flow_orig, rigid_flow_orig, flow_res_orig
+            del flow_hw, rigid_flow_hw, flow_res_hw, scene_flow
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+# ============================================================================
+# Generic Multi-GPU Processing Framework
+# ============================================================================
+# Note: Generic multi-GPU processing is complex due to pickling issues with
+# dataset loaders. For now, dataset-specific processors (like DynamicReplicaProcessor)
+# handle multi-GPU processing. This framework can be extended in the future
+# if needed for other datasets.

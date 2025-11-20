@@ -16,10 +16,12 @@ from .preprocessing import (
 )
 
 from .dataset_loaders import (
-    ImagePairLoader,
-    SequentialFrameLoader,
     DynamicReplicaLoader,
     CustomDatasetLoader
+)
+
+from .data_preprocessors import (
+    DynamicReplicaProcessor
 )
 
 __all__ = [
@@ -28,9 +30,8 @@ __all__ = [
     'RANSACAffineEstimator',
     'FlowProcessor',
     'DatasetLoader',
-    'ImagePairLoader',
-    'SequentialFrameLoader',
     'DynamicReplicaLoader',
     'CustomDatasetLoader',
+    'DynamicReplicaProcessor',
 ]
 
