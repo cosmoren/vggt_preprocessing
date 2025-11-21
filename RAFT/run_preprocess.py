@@ -6,7 +6,7 @@ the appropriate dataset processor.
 """
 
 from preprocessing import FlowProcessor
-from data_preprocessors import DynamicReplicaProcessor, MVSSynthProcessor, Sailvos3dProcessor
+from data_preprocessors import DynamicReplicaProcessor, MVSSynthProcessor, Sailvos3dProcessor, SpringProcessor, UnrealStereo4KProcessor 
 from dataset_loaders import DynamicReplicaLoader
 from pathlib import Path
 import torch
@@ -166,13 +166,13 @@ def main():
     """Main entry point for preprocessing script."""
     parser = argparse.ArgumentParser(description='Universal optical flow preprocessing')
     parser.add_argument('--dataset', type=str, default='dynamicreplica',
-                       choices=['dynamicreplica', 'mvs_synth', 'sailvos3d'],
+                       choices=['dynamicreplica', 'mvs_synth', 'sailvos3d', 'spring', 'unrealstereo4k'],
                        help='Dataset type to process')
     parser.add_argument('--mode', type=str, default='single_gpu',
                        choices=['single_gpu', 'multi_gpu', 'test'],
                        help='Processing mode')
-    parser.add_argument('--batch_size', type=int, default=10,
-                       help='Batch size for processing')
+    parser.add_argument('--batch_size', type=int, default=10,  
+                       help='Batch size for processing') #10 for dynamicreplica, 2 for mvs_synth, 10 for sailvos3d, 3 for spring
     parser.add_argument('--resize_k', type=int, default=8,
                        help='Resize to nearest multiple of k')
     parser.add_argument('--gpu_ids', type=int, nargs='+', default=[0, 1, 2],
@@ -247,6 +247,26 @@ def main():
         elif args.dataset == 'sailvos3d':
             Sailvos3dProcessor.process_single_gpu(
                 root_dir="/mnt/nfs/SpatialAI/wai_datasets/sailvos3d",
+                batch_size=args.batch_size,
+                device=args.device,
+                resize_k=args.resize_k,
+                output_dir=f"/work/Datasets/vggt_ft_optical_flow/{args.dataset}",
+                vis_dir=f"/work/Datasets/vggt_ft_flow_vis/{args.dataset}",
+                ransac_config=ransac_config
+            )
+        elif args.dataset == 'spring':
+            SpringProcessor.process_single_gpu(
+                root_dir="/mnt/nfs/SpatialAI/wai_datasets/spring",
+                batch_size=args.batch_size,
+                device=args.device,
+                resize_k=args.resize_k,
+                output_dir=f"/work/Datasets/vggt_ft_optical_flow/{args.dataset}",
+                vis_dir=f"/work/Datasets/vggt_ft_flow_vis/{args.dataset}",
+                ransac_config=ransac_config
+            )
+        elif args.dataset == 'unrealstereo4k':
+            UnrealStereo4KProcessor.process_single_gpu(
+                root_dir="/mnt/nfs/SpatialAI/wai_datasets/unrealstereo4k",
                 batch_size=args.batch_size,
                 device=args.device,
                 resize_k=args.resize_k,

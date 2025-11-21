@@ -47,6 +47,345 @@ def load_image_rgb(image_path: str) -> torch.Tensor:
     
     return img
 
+class UnrealStereo4KLoader(DatasetLoader):
+    """
+    Loader for UnrealStereo4K dataset.
+    
+    Each scene has images with naming pattern:
+    - {05d}_cam0.png
+    - {05d}_cam1.png
+    
+    Creates consecutive pairs separately for left and right images.
+    """
+    
+    def __init__(
+        self,
+        root_dir: str,
+        image_subdir: str = "images",
+        scene_pattern: Optional[str] = None,
+        scene_name: Optional[str] = None,
+        sort: bool = True
+    ):
+        """
+        Args:
+            root_dir: Root directory containing scene folders
+            image_subdir: Subdirectory name containing images (default: "images")
+            camera_type: Which camera to process ("left", "right", or "both")
+            scene_pattern: Glob pattern for scene folders (default: "*", ignored if scene_name is provided)
+            scene_name: Direct scene name for efficient single-scene loading (takes precedence over scene_pattern)
+            sort: Whether to sort scenes and images
+        """
+        self.root_dir = Path(root_dir)
+        self.image_subdir = image_subdir
+        self.sort = sort
+        
+        # Build pairs for each scene
+        self.pairs = []
+        self.scene_info = []  # Track which scene each pair belongs to
+        
+        # If scene_name is provided, use direct path (more efficient)
+        if scene_name is not None:
+            scene_dir = self.root_dir / scene_name
+            if not scene_dir.is_dir():
+                raise ValueError(f"Scene directory not found: {scene_dir}")
+            
+            images_dir = scene_dir / image_subdir
+            if not images_dir.exists():
+                raise ValueError(f"Images directory not found: {images_dir}")
+            
+            # Process left and right images
+            left_pairs = self._get_consecutive_pairs(images_dir, scene_name, "0")
+            self.pairs.extend(left_pairs)
+            self.scene_info.extend([(scene_name, "0")] * len(left_pairs))
+            
+
+            right_pairs = self._get_consecutive_pairs(images_dir, scene_name, "1")
+            self.pairs.extend(right_pairs)
+            self.scene_info.extend([(scene_name, "1")] * len(right_pairs))
+            
+            print(f"UnrealStereo4KLoader: Found {len(self.pairs)} image pairs for scene {scene_name}")
+        else:
+            # Use scene_pattern (backward compatibility)
+            if scene_pattern is None:
+                scene_pattern = "*"
+            
+            # Find all scene directories
+            scene_dirs = sorted(self.root_dir.glob(scene_pattern)) if sort else list(self.root_dir.glob(scene_pattern))
+            scene_dirs = [d for d in scene_dirs if d.is_dir()]
+            
+            if len(scene_dirs) == 0:
+                raise ValueError(f"No scene directories found in {root_dir} with pattern {scene_pattern}")
+            
+            for scene_dir in scene_dirs:
+                scene_name = scene_dir.name
+                images_dir = scene_dir / image_subdir
+                
+                if not images_dir.exists():
+                    print(f"Warning: {images_dir} does not exist, skipping scene {scene_name}")
+                    continue
+                
+                # Process left and/or right images
+                #if camera_type in ["left", "both"]:
+                #    left_pairs = self._get_consecutive_pairs(images_dir, scene_name, "left")
+                #    self.pairs.extend(left_pairs)
+                #    self.scene_info.extend([(scene_name, "left")] * len(left_pairs))
+                
+                #if camera_type in ["right", "both"]:
+                #    right_pairs = self._get_consecutive_pairs(images_dir, scene_name, "right")
+                #    self.pairs.extend(right_pairs)
+                #    self.scene_info.extend([(scene_name, "right")] * len(right_pairs))
+            
+            print(f"SpringLoader: Found {len(self.pairs)} image pairs across {len(scene_dirs)} scenes")
+
+    def _get_consecutive_pairs(
+        self,
+        images_dir: Path,
+        scene_name: str,
+        camera: str
+    ) -> List[Tuple[Path, Path]]:
+        """
+        Get consecutive pairs for a specific camera type.
+        
+        Args:
+            images_dir: Directory containing images
+            scene_name: Name of the scene
+            camera: "left" or "right"
+        
+        Returns:
+            List of (img1_path, img2_path) tuples
+        """
+        # Pattern: {scene_name}_{camera}-{04d}.png
+        pattern = f"*_cam{camera}.png"
+        image_paths = sorted(images_dir.glob(pattern)) if self.sort else list(images_dir.glob(pattern))
+        
+        if len(image_paths) < 2:
+            print(f"Warning: Scene {scene_name} {camera} has only {len(image_paths)} images, need at least 2")
+            return []
+        
+        # Create consecutive pairs: (0-1, 1-2, ..., n-2-n-1)
+        pairs = list(zip(image_paths[:-1], image_paths[1:]))
+        return pairs
+    
+    def __len__(self) -> int:
+        return len(self.pairs)
+    
+    def get_batch(
+        self,
+        indices: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Load a batch of consecutive image pairs."""
+        img1_list = []
+        img2_list = []
+        metadata = {
+            'img1_paths': [],
+            'img2_paths': [],
+            'scene_names': [],
+            'camera_types': [],
+            'pair_indices': []
+        }
+        
+        for idx in indices:
+            img1_path, img2_path = self.pairs[idx]
+            scene_name, camera_type = self.scene_info[idx]
+            
+            try:
+                img1 = load_image_rgb(str(img1_path))  # (3, H, W), float [0, 1]
+                img2 = load_image_rgb(str(img2_path))  # (3, H, W), float [0, 1]
+                
+                img1_list.append(img1)
+                img2_list.append(img2)
+                metadata['img1_paths'].append(str(img1_path))
+                metadata['img2_paths'].append(str(img2_path))
+                metadata['scene_names'].append(scene_name)
+                metadata['camera_types'].append(camera_type)
+                metadata['pair_indices'].append(idx)
+            except Exception as e:
+                print(f"Error loading pair {idx} ({img1_path}, {img2_path}): {e}")
+                raise
+        
+        # Stack into batches: (B, C, H, W)
+        img1_batch = torch.stack(img1_list, dim=0)
+        img2_batch = torch.stack(img2_list, dim=0)
+        
+        return img1_batch, img2_batch, metadata
+    
+    def get_all_pairs(self) -> List[Tuple[Path, Path]]:
+        return self.pairs
+    
+    def get_scene_info(self) -> List[Tuple[str, str]]:
+        """Get scene and camera type for each pair."""
+        return self.scene_info
+
+
+class SpringLoader(DatasetLoader):
+    """
+    Loader for DynamicReplica dataset.
+    
+    Each scene has images with naming pattern:
+    - frame_left_{04d}.png
+    - frame_right_{04d}.png
+    
+    Creates consecutive pairs separately for left and right images.
+    """
+    
+    def __init__(
+        self,
+        root_dir: str,
+        image_subdir: str = "images",
+        scene_pattern: Optional[str] = None,
+        scene_name: Optional[str] = None,
+        sort: bool = True
+    ):
+        """
+        Args:
+            root_dir: Root directory containing scene folders
+            image_subdir: Subdirectory name containing images (default: "images")
+            camera_type: Which camera to process ("left", "right", or "both")
+            scene_pattern: Glob pattern for scene folders (default: "*", ignored if scene_name is provided)
+            scene_name: Direct scene name for efficient single-scene loading (takes precedence over scene_pattern)
+            sort: Whether to sort scenes and images
+        """
+        self.root_dir = Path(root_dir)
+        self.image_subdir = image_subdir
+        self.sort = sort
+        
+        # Build pairs for each scene
+        self.pairs = []
+        self.scene_info = []  # Track which scene each pair belongs to
+        
+        # If scene_name is provided, use direct path (more efficient)
+        if scene_name is not None:
+            scene_dir = self.root_dir / scene_name
+            if not scene_dir.is_dir():
+                raise ValueError(f"Scene directory not found: {scene_dir}")
+            
+            images_dir = scene_dir / image_subdir
+            if not images_dir.exists():
+                raise ValueError(f"Images directory not found: {images_dir}")
+            
+            # Process left and right images
+            left_pairs = self._get_consecutive_pairs(images_dir, scene_name, "left")
+            self.pairs.extend(left_pairs)
+            self.scene_info.extend([(scene_name, "left")] * len(left_pairs))
+            
+
+            right_pairs = self._get_consecutive_pairs(images_dir, scene_name, "right")
+            self.pairs.extend(right_pairs)
+            self.scene_info.extend([(scene_name, "right")] * len(right_pairs))
+            
+            print(f"SpringLoader: Found {len(self.pairs)} image pairs for scene {scene_name}")
+        else:
+            # Use scene_pattern (backward compatibility)
+            if scene_pattern is None:
+                scene_pattern = "*"
+            
+            # Find all scene directories
+            scene_dirs = sorted(self.root_dir.glob(scene_pattern)) if sort else list(self.root_dir.glob(scene_pattern))
+            scene_dirs = [d for d in scene_dirs if d.is_dir()]
+            
+            if len(scene_dirs) == 0:
+                raise ValueError(f"No scene directories found in {root_dir} with pattern {scene_pattern}")
+            
+            for scene_dir in scene_dirs:
+                scene_name = scene_dir.name
+                images_dir = scene_dir / image_subdir
+                
+                if not images_dir.exists():
+                    print(f"Warning: {images_dir} does not exist, skipping scene {scene_name}")
+                    continue
+                
+                # Process left and/or right images
+                #if camera_type in ["left", "both"]:
+                #    left_pairs = self._get_consecutive_pairs(images_dir, scene_name, "left")
+                #    self.pairs.extend(left_pairs)
+                #    self.scene_info.extend([(scene_name, "left")] * len(left_pairs))
+                
+                #if camera_type in ["right", "both"]:
+                #    right_pairs = self._get_consecutive_pairs(images_dir, scene_name, "right")
+                #    self.pairs.extend(right_pairs)
+                #    self.scene_info.extend([(scene_name, "right")] * len(right_pairs))
+            
+            print(f"SpringLoader: Found {len(self.pairs)} image pairs across {len(scene_dirs)} scenes")
+
+    def _get_consecutive_pairs(
+        self,
+        images_dir: Path,
+        scene_name: str,
+        camera: str
+    ) -> List[Tuple[Path, Path]]:
+        """
+        Get consecutive pairs for a specific camera type.
+        
+        Args:
+            images_dir: Directory containing images
+            scene_name: Name of the scene
+            camera: "left" or "right"
+        
+        Returns:
+            List of (img1_path, img2_path) tuples
+        """
+        # Pattern: {scene_name}_{camera}-{04d}.png
+        pattern = f"frame_{camera}_*.png"
+        image_paths = sorted(images_dir.glob(pattern)) if self.sort else list(images_dir.glob(pattern))
+        
+        if len(image_paths) < 2:
+            print(f"Warning: Scene {scene_name} {camera} has only {len(image_paths)} images, need at least 2")
+            return []
+        
+        # Create consecutive pairs: (0-1, 1-2, ..., n-2-n-1)
+        pairs = list(zip(image_paths[:-1], image_paths[1:]))
+        return pairs
+    
+    def __len__(self) -> int:
+        return len(self.pairs)
+    
+    def get_batch(
+        self,
+        indices: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Load a batch of consecutive image pairs."""
+        img1_list = []
+        img2_list = []
+        metadata = {
+            'img1_paths': [],
+            'img2_paths': [],
+            'scene_names': [],
+            'camera_types': [],
+            'pair_indices': []
+        }
+        
+        for idx in indices:
+            img1_path, img2_path = self.pairs[idx]
+            scene_name, camera_type = self.scene_info[idx]
+            
+            try:
+                img1 = load_image_rgb(str(img1_path))  # (3, H, W), float [0, 1]
+                img2 = load_image_rgb(str(img2_path))  # (3, H, W), float [0, 1]
+                
+                img1_list.append(img1)
+                img2_list.append(img2)
+                metadata['img1_paths'].append(str(img1_path))
+                metadata['img2_paths'].append(str(img2_path))
+                metadata['scene_names'].append(scene_name)
+                metadata['camera_types'].append(camera_type)
+                metadata['pair_indices'].append(idx)
+            except Exception as e:
+                print(f"Error loading pair {idx} ({img1_path}, {img2_path}): {e}")
+                raise
+        
+        # Stack into batches: (B, C, H, W)
+        img1_batch = torch.stack(img1_list, dim=0)
+        img2_batch = torch.stack(img2_list, dim=0)
+        
+        return img1_batch, img2_batch, metadata
+    
+    def get_all_pairs(self) -> List[Tuple[Path, Path]]:
+        return self.pairs
+    
+    def get_scene_info(self) -> List[Tuple[str, str]]:
+        """Get scene and camera type for each pair."""
+        return self.scene_info
+
 
 class DynamicReplicaLoader(DatasetLoader):
     """

@@ -6,7 +6,7 @@ logic like scene organization, multi-camera handling, etc.
 """
 
 from preprocessing import FlowProcessor
-from dataset_loaders import DynamicReplicaLoader, MVSSynthLoader, Sailvos3dLoader
+from dataset_loaders import DynamicReplicaLoader, MVSSynthLoader, Sailvos3dLoader, SpringLoader, UnrealStereo4KLoader
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import torch
@@ -453,7 +453,7 @@ class MVSSynthProcessor:
                 )
                 
                 if len(loader) > 0:
-                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} left pairs")
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
                     processor.process_dataset(
                         dataset_loader=loader,
                         batch_size=batch_size,
@@ -573,7 +573,7 @@ class Sailvos3dProcessor:
                 )
                 
                 if len(loader) > 0:
-                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} left pairs")
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
                     processor.process_dataset(
                         dataset_loader=loader,
                         batch_size=batch_size,
@@ -598,3 +598,244 @@ class Sailvos3dProcessor:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+
+class SpringProcessor:
+    """Processor for Spring dataset with scene-based organization."""
+
+    @staticmethod
+    def get_all_scenes(root_dir: str) -> List[str]:
+        """
+        Get list of all scene names in the dataset.
+        
+        Args:
+            root_dir: Root directory containing scene folders
+        
+        Returns:
+            List of scene names
+        """
+        root_path = Path(root_dir)
+        scene_dirs = sorted([d for d in root_path.iterdir() if d.is_dir() and os.path.exists(d / "images")])
+        return [d.name for d in scene_dirs]
+    
+    @staticmethod
+    def process_single_gpu(
+        root_dir: str,
+        batch_size: int = 50,
+        device: str = 'cuda',
+        resize_k: int = 8,
+        output_dir: str = "./output_spring",
+        vis_dir: Optional[str] = None,
+        ransac_config: Optional[dict] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process spring dataset on a single GPU.
+        
+        Processes one scene at a time, using one dataloader per scene.
+        Always processes both left and right cameras for each scene.
+        
+        Args:
+            root_dir: Root directory of spring dataset
+            batch_size: Batch size for processing (default: 50)
+            device: Device to run on
+            resize_k: Resize to nearest multiple of k
+            output_dir: Output directory for .pt files
+            vis_dir: Directory to save visualization images (optional)
+            ransac_config: RANSAC configuration dictionary
+        
+        Returns:
+            List of result dictionaries
+        """
+        # Default RANSAC config
+        if ransac_config is None:
+            ransac_config = {
+                'num_iters': 1000,
+                'sample_size': 200,
+                'inlier_thresh': 120.0,
+                'min_inlier_ratio': 0.2,
+                'verbose': True
+            }
+        
+        # Get all scenes
+        scenes = SpringProcessor.get_all_scenes(root_dir)
+        print(f"Found {len(scenes)} scenes to process on {device}")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize RANSAC failure log file (clear previous log)
+        ransac_failure_log = output_path / 'ransac_failures.txt'
+        if ransac_failure_log.exists():
+            ransac_failure_log.unlink()  # Clear previous log
+        
+        vis_path = Path(vis_dir) if vis_dir else None
+        if vis_path:
+            vis_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize processor (reused across scenes)
+        processor = FlowProcessor(
+            device=device,
+            resize_k=resize_k,
+            ransac_config=ransac_config
+        )
+        
+        
+        # Process each scene separately
+        for scene_idx, scene_name in enumerate(scenes):
+            print(f"\n[{device}] Processing scene {scene_idx + 1}/{len(scenes)}: {scene_name}")
+            
+            try:
+                # Process images
+                loader = SpringLoader(
+                    root_dir=root_dir,
+                    image_subdir="images",
+                    sort=True,
+                    scene_name=scene_name,
+                )
+                
+                if len(loader) > 0:
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
+                    processor.process_dataset(
+                        dataset_loader=loader,
+                        batch_size=batch_size,
+                        save_dir=output_path,
+                        vis_dir=vis_path
+                    )
+                    
+                del loader
+                torch.cuda.empty_cache()
+                
+                
+                print(f"[{device}] Completed scene: {scene_name}")
+                
+            except Exception as e:
+                print(f"[{device}] Error processing scene {scene_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Cleanup
+        del processor
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+
+class UnrealStereo4KProcessor:
+    """Processor for UnrealStereo4K dataset with scene-based organization."""
+
+    @staticmethod
+    def get_all_scenes(root_dir: str) -> List[str]:
+        """
+        Get list of all scene names in the dataset.
+        
+        Args:
+            root_dir: Root directory containing scene folders
+        
+        Returns:
+            List of scene names
+        """
+        root_path = Path(root_dir)
+        scene_dirs = sorted([d for d in root_path.iterdir() if d.is_dir() and os.path.exists(d / "images")])
+        return [d.name for d in scene_dirs]
+    
+    @staticmethod
+    def process_single_gpu(
+        root_dir: str,
+        batch_size: int = 50,
+        device: str = 'cuda',
+        resize_k: int = 8,
+        output_dir: str = "./output_unrealstereo4k",
+        vis_dir: Optional[str] = None,
+        ransac_config: Optional[dict] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process unrealstereo4k dataset on a single GPU.
+        
+        Processes one scene at a time, using one dataloader per scene.
+        Always processes both left and right cameras for each scene.
+        
+        Args:
+            root_dir: Root directory of unrealstereo4k dataset
+            batch_size: Batch size for processing (default: 50)
+            device: Device to run on
+            resize_k: Resize to nearest multiple of k
+            output_dir: Output directory for .pt files
+            vis_dir: Directory to save visualization images (optional)
+            ransac_config: RANSAC configuration dictionary
+        
+        Returns:
+            List of result dictionaries
+        """
+        # Default RANSAC config
+        if ransac_config is None:
+            ransac_config = {
+                'num_iters': 1000,
+                'sample_size': 200,
+                'inlier_thresh': 120.0,
+                'min_inlier_ratio': 0.2,
+                'verbose': True
+            }
+        
+        # Get all scenes
+        scenes = UnrealStereo4KProcessor.get_all_scenes(root_dir)
+        print(f"Found {len(scenes)} scenes to process on {device}")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize RANSAC failure log file (clear previous log)
+        ransac_failure_log = output_path / 'ransac_failures.txt'
+        if ransac_failure_log.exists():
+            ransac_failure_log.unlink()  # Clear previous log
+        
+        vis_path = Path(vis_dir) if vis_dir else None
+        if vis_path:
+            vis_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize processor (reused across scenes)
+        processor = FlowProcessor(
+            device=device,
+            resize_k=resize_k,
+            ransac_config=ransac_config
+        )
+        
+        
+        # Process each scene separately
+        for scene_idx, scene_name in enumerate(scenes):
+            print(f"\n[{device}] Processing scene {scene_idx + 1}/{len(scenes)}: {scene_name}")
+            
+            try:
+                # Process images
+                loader = UnrealStereo4KLoader(
+                    root_dir=root_dir,
+                    image_subdir="images",
+                    sort=True,
+                    scene_name=scene_name,
+                )
+                
+                if len(loader) > 0:
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
+                    processor.process_dataset(
+                        dataset_loader=loader,
+                        batch_size=batch_size,
+                        save_dir=output_path,
+                        vis_dir=vis_path
+                    )
+                    
+                del loader
+                torch.cuda.empty_cache()
+                
+                
+                print(f"[{device}] Completed scene: {scene_name}")
+                
+            except Exception as e:
+                print(f"[{device}] Error processing scene {scene_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Cleanup
+        del processor
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+        

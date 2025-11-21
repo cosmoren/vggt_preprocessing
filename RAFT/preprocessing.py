@@ -570,7 +570,7 @@ class FlowProcessor:
             scale_H = orig_H / resized_H
             scale_W = orig_W / resized_W
 
-            # print(f"debug: resized_H: {resized_H}, resized_W: {resized_W}; orig_H: {orig_H}, orig_W: {orig_W};")
+            print(f"debug: resized_H: {resized_H}, resized_W: {resized_W}; orig_H: {orig_H}, orig_W: {orig_W};")
 
             flow_orig = flow
             rigid_flow_orig = rigid_flow
@@ -601,7 +601,7 @@ class FlowProcessor:
                 ).squeeze(0)  # (2, orig_H, orig_W)
                 flow_res_orig = flow_res_orig * torch.tensor([scale_W, scale_H], device=flow_res.device).view(2, 1, 1)
 
-            #print(f"debug: flow_orig.shape: {flow_orig.shape}, rigid_flow_orig.shape: {rigid_flow_orig.shape}, flow_res_orig.shape: {flow_res_orig.shape};")   
+            print(f"debug: flow_orig.shape: {flow_orig.shape}, rigid_flow_orig.shape: {rigid_flow_orig.shape}, flow_res_orig.shape: {flow_res_orig.shape};")   
             # Convert to (H, W, 2) format
             flow_hw = flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
             rigid_flow_hw = rigid_flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
