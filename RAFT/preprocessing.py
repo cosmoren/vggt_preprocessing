@@ -14,6 +14,54 @@ from abc import ABC, abstractmethod
 from typing import Tuple, List, Optional, Dict, Any
 from pathlib import Path
 import os
+import clip
+from PIL import Image
+from pathlib import Path
+
+def compute_clip_similarity(
+    img1_path: Path,
+    img2_path: Path,
+    model,
+    preprocess,
+    device: str = "cuda"
+) -> float:
+    """
+    Compute CLIP similarity between two images.
+    
+    Args:
+        img1_path: Path to first image
+        img2_path: Path to second image
+        model: CLIP model
+        preprocess: CLIP preprocessing function
+        device: Device to run on
+    
+    Returns:
+        Similarity score (cosine similarity) between -1 and 1
+    """
+    try:
+        # Load and preprocess images
+        img1 = Image.open(img1_path).convert("RGB")
+        img2 = Image.open(img2_path).convert("RGB")
+        
+        img1_tensor = preprocess(img1).unsqueeze(0).to(device)
+        img2_tensor = preprocess(img2).unsqueeze(0).to(device)
+        
+        # Get image features
+        with torch.no_grad():
+            img1_features = model.encode_image(img1_tensor)
+            img2_features = model.encode_image(img2_tensor)
+            
+            # Normalize features
+            img1_features = img1_features / img1_features.norm(dim=-1, keepdim=True)
+            img2_features = img2_features / img2_features.norm(dim=-1, keepdim=True)
+            
+            # Compute cosine similarity
+            similarity = (img1_features * img2_features).sum(dim=-1).item()
+        
+        return similarity
+    except Exception as e:
+        print(f"Error computing similarity for {img1_path} and {img2_path}: {e}")
+        return None
 
 class ImagePreprocessor:
     """Handles image preprocessing and resizing operations."""
@@ -46,7 +94,7 @@ class ImagePreprocessor:
     def resize_to_nearest_multiple(
         self, 
         x: torch.Tensor, 
-        k: int = 32, 
+        k: int = 8, 
         mode: str = 'bilinear'
     ) -> torch.Tensor:
         """
@@ -66,6 +114,7 @@ class ImagePreprocessor:
         
         new_H = max(new_H, k)
         new_W = max(new_W, k)
+
         
         if new_H == H and new_W == W:
             return x
@@ -77,6 +126,7 @@ class ImagePreprocessor:
             align_corners=align_corners
         )
         return x_resized
+    
 
 
 class RAFTFlowEstimator:
@@ -125,6 +175,10 @@ class RAFTFlowEstimator:
             Optical flow tensor (B, 2, H, W) or list of flows if return_all_iterations=True
         """
         with torch.no_grad():
+            # print(f"img1 batch size:{img1_batch.shape}")
+            # print(f"img2 batch size:{img2_batch.shape}")
+            # print(f"img1 size being multiple of 8: {img1_batch.shape[2]%8==0 and img1_batch.shape[3]%8==0}")
+            # print(f"img2 size being multiple of 8: {img2_batch.shape[2]%8==0 and img2_batch.shape[3]%8==0}")
             list_of_flows = self.model(img1_batch, img2_batch)
         
         if return_all_iterations:
@@ -265,7 +319,8 @@ class RANSACAffineEstimator:
     
     def estimate_batch(
         self,
-        flow_batch: torch.Tensor
+        flow_batch: torch.Tensor,
+        clip_similarity: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[torch.Tensor]], torch.Tensor]:
         """
         Estimate affine transformation for a batch of flows.
@@ -292,7 +347,13 @@ class RANSACAffineEstimator:
         
         for b in range(B):
             flow_1img = flow_batch[b]  # (2, H, W)
-            rigid_b, res_b, M_b, mask_b = self.estimate_single(flow_1img)
+            if clip_similarity[b] < 0.85:
+                rigid_b = torch.zeros_like(flow_1img)
+                res_b = flow_1img.clone()
+                M_b = None
+                mask_b = torch.zeros((H, W), dtype=torch.bool, device=device)
+            else:
+                rigid_b, res_b, M_b, mask_b = self.estimate_single(flow_1img)
             rigid_flow_all[b] = rigid_b.to(dtype)
             flow_res_all[b] = res_b.to(dtype)
             inlier_masks[b] = mask_b
@@ -380,6 +441,8 @@ class FlowProcessor:
         self,
         img1_batch: torch.Tensor,
         img2_batch: torch.Tensor,
+        img1_paths: List[str],
+        img2_paths: List[str],
         compute_rigid: bool = True,
         compute_dynamic: bool = False
     ) -> Dict[str, torch.Tensor]:
@@ -402,11 +465,14 @@ class FlowProcessor:
                 - 'affine_matrices': List of affine matrices (if compute_rigid=True)
         """
         # Preprocess
+        clip_similarity = self.clip_batch(img1_paths, img2_paths)
         img1_processed = self.preprocessor.preprocess(img1_batch).to(self.device)
         img2_processed = self.preprocessor.preprocess(img2_batch).to(self.device)
         
         # Store original dimensions
         _, _, orig_H, orig_W = img1_batch.shape
+
+        
         
         # Resize
         img1_resized = self.preprocessor.resize_to_nearest_multiple(
@@ -428,7 +494,7 @@ class FlowProcessor:
         
         # RANSAC decomposition
         if compute_rigid:
-            rigid_flow, flow_res, M_list, inlier_masks = self.ransac_estimator.estimate_batch(flow)
+            rigid_flow, flow_res, M_list, inlier_masks = self.ransac_estimator.estimate_batch(flow, clip_similarity)
             results.update({
                 'rigid_flow': rigid_flow,
                 'flow_res': flow_res,
@@ -443,6 +509,28 @@ class FlowProcessor:
             results['dynamic_flow'] = dynamic_flow
         
         return results
+    
+    def clip_batch(
+        self,
+        img1_paths: List[str],
+        img2_paths: List[str],
+    ) -> torch.Tensor:
+        """
+        Compute CLIP similarity for a batch of image pairs.
+        """
+        B = len(img1_paths)
+        model, preprocess = clip.load("ViT-B/32", device=self.device)
+        model.eval()
+        clip_similarity = []
+        for b in range(B):
+            clip_similarity.append(compute_clip_similarity(
+                Path(img1_paths[b]),
+                Path(img2_paths[b]),
+                model,
+                preprocess,
+                self.device
+            ))
+        return torch.tensor(clip_similarity)
     
     def process_dataset(
         self,
@@ -490,8 +578,10 @@ class FlowProcessor:
             results = self.process_batch(
                 img1_batch, 
                 img2_batch,
+                metadata['img1_paths'],
+                metadata['img2_paths'],
                 compute_rigid=True,
-                compute_dynamic=True
+                compute_dynamic=True,
             )
             
             # Add metadata
@@ -570,7 +660,7 @@ class FlowProcessor:
             scale_H = orig_H / resized_H
             scale_W = orig_W / resized_W
 
-            print(f"debug: resized_H: {resized_H}, resized_W: {resized_W}; orig_H: {orig_H}, orig_W: {orig_W};")
+            # print(f"debug: resized_H: {resized_H}, resized_W: {resized_W}; orig_H: {orig_H}, orig_W: {orig_W};")
 
             flow_orig = flow
             rigid_flow_orig = rigid_flow
@@ -601,7 +691,7 @@ class FlowProcessor:
                 ).squeeze(0)  # (2, orig_H, orig_W)
                 flow_res_orig = flow_res_orig * torch.tensor([scale_W, scale_H], device=flow_res.device).view(2, 1, 1)
 
-            print(f"debug: flow_orig.shape: {flow_orig.shape}, rigid_flow_orig.shape: {rigid_flow_orig.shape}, flow_res_orig.shape: {flow_res_orig.shape};")   
+            # print(f"debug: flow_orig.shape: {flow_orig.shape}, rigid_flow_orig.shape: {rigid_flow_orig.shape}, flow_res_orig.shape: {flow_res_orig.shape};")   
             # Convert to (H, W, 2) format
             flow_hw = flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)
             rigid_flow_hw = rigid_flow_orig.permute(1, 2, 0)  # (orig_H, orig_W, 2)

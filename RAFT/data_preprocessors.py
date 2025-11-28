@@ -6,31 +6,54 @@ logic like scene organization, multi-camera handling, etc.
 """
 
 from preprocessing import FlowProcessor
-from dataset_loaders import DynamicReplicaLoader, MVSSynthLoader, Sailvos3dLoader, SpringLoader, UnrealStereo4KLoader
+from dataset_loaders import DynamicReplicaLoader, MVSSynthLoader, Sailvos3dLoader, SpringLoader, UnrealStereo4KLoader, Eth3DLoader, ScannetppV2Loader
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import torch
 import multiprocessing as mp
 import os
-
+import numpy as np
 
 class DynamicReplicaProcessor:
     """Processor for DynamicReplica dataset with scene-based organization."""
     
     @staticmethod
-    def get_all_scenes(root_dir: str) -> List[str]:
+    def get_all_scenes(root_dir: str, output_dir: Optional[str] = None) -> List[str]:
         """
         Get list of all scene names in the dataset.
+        Skips scenes that are already preprocessed and stored in the output directory.
         
         Args:
             root_dir: Root directory containing scene folders
+            output_dir: Output directory where preprocessed scenes are stored (optional)
         
         Returns:
-            List of scene names
+            List of scene names that haven't been processed yet
         """
         root_path = Path(root_dir)
         scene_dirs = sorted([d for d in root_path.iterdir() if d.is_dir()])
-        return [d.name for d in scene_dirs]
+        all_scenes = [d.name for d in scene_dirs]
+        
+        # If output_dir is provided, filter out already-processed scenes
+        if output_dir is not None:
+            output_path = Path(output_dir)
+            if output_path.exists():
+                processed_scenes = set()
+                # Check each scene directory in output_dir
+                for scene_dir in output_path.iterdir():
+                    if scene_dir.is_dir():
+                        # Check if scene directory has any .pt files (indicating it's been processed)
+                        pt_files = list(scene_dir.glob("*.pt"))
+                        if len(pt_files) > 0:
+                            processed_scenes.add(scene_dir.name)
+                
+                # Filter out processed scenes
+                unprocessed_scenes = [s for s in all_scenes if s not in processed_scenes]
+                if len(processed_scenes) > 0:
+                    print(f"Skipping {len(processed_scenes)} already-processed scenes")
+                return unprocessed_scenes
+        
+        return all_scenes
     
     @staticmethod
     def process_single_scene(
@@ -173,8 +196,8 @@ class DynamicReplicaProcessor:
         Returns:
             List of (success, scene_name) tuples
         """
-        # Get all scenes
-        scenes = DynamicReplicaProcessor.get_all_scenes(root_dir)
+        # Get all scenes (excluding already-processed ones)
+        scenes = DynamicReplicaProcessor.get_all_scenes(root_dir, output_dir=output_dir)
         print(f"Found {len(scenes)} scenes to process")
         
         # Initialize output directory and RANSAC failure log
@@ -271,8 +294,8 @@ class DynamicReplicaProcessor:
                 'verbose': True
             }
         
-        # Get all scenes
-        scenes = DynamicReplicaProcessor.get_all_scenes(root_dir)
+        # Get all scenes (excluding already-processed ones)
+        scenes = DynamicReplicaProcessor.get_all_scenes(root_dir, output_dir=output_dir)
         print(f"Found {len(scenes)} scenes to process on {device}")
         
         output_path = Path(output_dir)
@@ -478,7 +501,249 @@ class MVSSynthProcessor:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+
+class Eth3DProcessor:
+    """Processor for ETH3D dataset with scene-based organization."""
+
+    @staticmethod
+    def get_all_scenes(root_dir: str) -> List[str]:
+        """
+        Get list of all scene names in the dataset.
+        
+        Args:
+            root_dir: Root directory containing scene folders
+        
+        Returns:
+            List of scene names
+        """
+        root_path = Path(root_dir)
+        scene_dirs = sorted([d for d in root_path.iterdir() if d.is_dir()])
+        return [d.name for d in scene_dirs]
     
+    @staticmethod
+    def process_single_gpu(
+        root_dir: str,
+        batch_size: int = 50,
+        device: str = 'cuda',
+        resize_k: int = 8,
+        output_dir: str = "./output_eth3d",
+        vis_dir: Optional[str] = None,
+        ransac_config: Optional[dict] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process eth3d dataset on a single GPU.
+        
+        Processes one scene at a time, using one dataloader per scene.
+        Always processes both left and right cameras for each scene.
+        
+        Args:
+            root_dir: Root directory of eth3d dataset
+            batch_size: Batch size for processing (default: 50)
+            device: Device to run on
+            resize_k: Resize to nearest multiple of k
+            output_dir: Output directory for .pt files
+            vis_dir: Directory to save visualization images (optional)
+            ransac_config: RANSAC configuration dictionary
+        
+        Returns:
+            List of result dictionaries
+        """
+        # Default RANSAC config
+        if ransac_config is None:
+            ransac_config = {
+                'num_iters': 1000,
+                'sample_size': 200,
+                'inlier_thresh': 120.0,
+                'min_inlier_ratio': 0.2,
+                'verbose': True
+            }
+        
+        # Get all scenes
+        scenes = Eth3DProcessor.get_all_scenes(root_dir)
+        print(f"Found {len(scenes)} scenes to process on {device}")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize RANSAC failure log file (clear previous log)
+        ransac_failure_log = output_path / 'ransac_failures.txt'
+        if ransac_failure_log.exists():
+            ransac_failure_log.unlink()  # Clear previous log
+        
+        vis_path = Path(vis_dir) if vis_dir else None
+        if vis_path:
+            vis_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize processor (reused across scenes)
+        processor = FlowProcessor(
+            device=device,
+            resize_k=resize_k,
+            ransac_config=ransac_config
+        )
+        
+        
+        # Process each scene separately
+        for scene_idx, scene_name in enumerate(scenes):
+            print(f"\n[{device}] Processing scene {scene_idx + 1}/{len(scenes)}: {scene_name}")
+            
+            try:
+                # Process images
+                loader = Eth3DLoader(
+                    root_dir=root_dir,
+                    image_subdir="images",
+                    sort=True,
+                    scene_name=scene_name,
+                )
+                
+                if len(loader) > 0:
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
+                    processor.process_dataset(
+                        dataset_loader=loader,
+                        batch_size=batch_size,
+                        save_dir=output_path,
+                        vis_dir=vis_path
+                    )
+                    
+                del loader
+                torch.cuda.empty_cache()
+                
+                
+                print(f"[{device}] Completed scene: {scene_name}")
+                
+            except Exception as e:
+                print(f"[{device}] Error processing scene {scene_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Cleanup
+        del processor
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+
+class ScannetppV2Processor:
+    """Processor for ScannetppV2 dataset with scene-based organization."""
+
+    @staticmethod
+    def get_all_scenes(root_dir: str) -> List[str]:
+        """
+        Get list of all scene names in the dataset.
+        
+        Args:
+            root_dir: Root directory containing scene folders
+        
+        Returns:
+            List of scene names
+        """
+        test_scenes = np.load("/mnt/nfs/SpatialAI/wai_datasets/map-anything/mapanything_dataset_metadata/test/scannetppv2_scene_list_test.npy", allow_pickle=True).tolist()
+        root_path = Path(root_dir)
+        scene_dirs = sorted([d for d in root_path.iterdir() if d.is_dir() and os.path.exists(d / "images") and d.name in test_scenes])
+        return [d.name for d in scene_dirs]
+
+    @staticmethod
+    def process_single_gpu(
+        root_dir: str,
+        batch_size: int = 50,
+        device: str = 'cuda',
+        resize_k: int = 8,
+        output_dir: str = "./output_scannetppv2",
+        vis_dir: Optional[str] = None,
+        ransac_config: Optional[dict] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process scannetppv2 dataset on a single GPU.
+        
+        Processes one scene at a time, using one dataloader per scene.
+        Always processes both left and right cameras for each scene.
+        
+        Args:
+            root_dir: Root directory of scannetppv2 dataset
+            batch_size: Batch size for processing (default: 50)
+            device: Device to run on
+            resize_k: Resize to nearest multiple of k
+            output_dir: Output directory for .pt files
+            vis_dir: Directory to save visualization images (optional)
+            ransac_config: RANSAC configuration dictionary
+        
+        Returns:
+            List of result dictionaries
+        """
+        # Default RANSAC config
+        if ransac_config is None:
+            ransac_config = {
+                'num_iters': 1000,
+                'sample_size': 200,
+                'inlier_thresh': 120.0,
+                'min_inlier_ratio': 0.2,
+                'verbose': True
+            }
+        
+        # Get all scenes
+        scenes = ScannetppV2Processor.get_all_scenes(root_dir)
+        print(f"Found {len(scenes)} scenes to process on {device}")
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize RANSAC failure log file (clear previous log)
+        ransac_failure_log = output_path / 'ransac_failures.txt'
+        if ransac_failure_log.exists():
+            ransac_failure_log.unlink()  # Clear previous log
+        
+        vis_path = Path(vis_dir) if vis_dir else None
+        if vis_path:
+            vis_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize processor (reused across scenes)
+        processor = FlowProcessor(
+            device=device,
+            resize_k=resize_k,
+            ransac_config=ransac_config
+        )
+        
+        
+        # Process each scene separately
+        for scene_idx, scene_name in enumerate(scenes):
+            print(f"\n[{device}] Processing scene {scene_idx + 1}/{len(scenes)}: {scene_name}")
+            
+            try:
+                # Process images
+                loader = ScannetppV2Loader(
+                    root_dir=root_dir,
+                    image_subdir="images",
+                    sort=True,
+                    scene_name=scene_name,
+                )
+                
+                if len(loader) > 0:
+                    print(f"[{device}] Scene {scene_name}: Processing {len(loader)} image pairs")
+                    processor.process_dataset(
+                        dataset_loader=loader,
+                        batch_size=batch_size,
+                        save_dir=output_path,
+                        vis_dir=vis_path
+                    )
+                    
+                del loader
+                torch.cuda.empty_cache()
+                
+                
+                print(f"[{device}] Completed scene: {scene_name}")
+                
+            except Exception as e:
+                print(f"[{device}] Error processing scene {scene_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Cleanup
+        del processor
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"\n[{device}] Single GPU processing complete. Processed {len(scenes)} scenes.")
+
+
 class Sailvos3dProcessor:
     """Processor for Sailvos3d dataset with scene-based organization."""
 
